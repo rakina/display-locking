@@ -275,14 +275,21 @@ Acquire performs the following steps:
 
 Note that the acquire call takes options, consisting of the following key-value
 pairs:
-* (optional) timeout: timeoutInMilliseconds
+* (optional) `timeout`: `timeoutInMilliseconds`
   * This is an optional timeout value for the duration of the lock. When the
-    lock is acquired, and commit is not called within timeoutInMilliseconds
+    lock is acquired, and commit is not called within `timeoutInMilliseconds`
     milliseconds, the lock will be automatically committed. This is a safety
     valve for protecting pages from inadvertently leaving an element locked
     indefinitely due to uncaught exceptions or other bugs in the code. For a
     more sophisticated use cases, the value of Infinity will effectively disable
     the timeout.
+* (optional) `activatable`: `true|false`
+  * Signifies whether the user-agent can automatically unlock/commit the lock
+    when the browser needs to *activate* the locked element or its descendants.
+    See [element activation section](#element-activation) for more details.
+  * Not setting this, or setting this to `false`,
+    means this element and its descendants will be ignored in cases like
+    find-in-page, anchor link navigation, focus navigation, etc.
 
 ##### DOM modifications in the locked state
 
@@ -296,6 +303,12 @@ when queried, will force style or layout synchronously in order to return correc
 values. When the element is painted, the current state of the DOM is not visible
 to the user. In lock-before-append mode, this means that the element is
 effectively display: none.
+
+##### DisplayLockContext.locked
+
+This is a boolean value that will be `true`
+if the `Element` associated with this `DisplayLockContext` is in the locked state,
+and `false` if not.
 
 ##### DisplayLockContext.update()
 
@@ -341,6 +354,61 @@ This operation combines the effects of an `update()` and a `commit()` calls:
 * It causes the element to be co-operatively updated.
 * When the update is finished, the element is committed resulting in visual
   updates to appear on screen.
+
+
+##### Element activation
+
+When an element is locked,
+there are some actions in the page that might require the element to get unlocked and be rendered to work properly.
+
+If the browser needs to *activate* a locked element
+or an element that has one or more locked ancestors,
+in order to make the activated element be visible,
+it will commit all locked elements in the ancestor chain of the element to be activated,
+unless at least one of them is locked without the `activatable` flag set to `true`.
+
+*Activating an element* is defined as one of the following actions:
+ - `focus()` is called on the element
+ - `scrollIntoView()` is called on the element
+ - Tab order navigation lands on the element
+ - Anchor link navigation navigates to the element
+ - Find-in-page active match navigation goes to the element
+
+For all the elements that we commit as part of element activation,
+we will send a `beforeactivate` event to it just before committing.
+
+##### beforeactivate event
+
+| property  | value  |
+|---|---|
+| bubbles  | true  |
+| composed | false |
+| target  | the previously-locked ancestor |
+| activatedElement  | The element that needs activation  |
+
+
+Consider this tree structure:
+```html
+<div id="first">
+ <div id="second"> <!-- locked -->
+  <div id="third">
+    blah
+    <div id="fourth">  <!-- locked -->
+     bleh
+    </div>
+  </div>
+ </div>
+<div>
+```
+
+If we need to activate `#fourth` div,
+then two `beforeactivate` events will be fired.
+One targeted at `#fourth` and one targeted at `#second`.
+The `activatedElement` in both of them is the `#fourth` div.
+
+If instead we need to activate `#third` div,
+only one `beforeactivate` event will be fired,
+at `#second` with `#third` in the `activatedElement` field.
 
 ---
 ### Implementation description
@@ -501,7 +569,7 @@ Let's revisit the motivating examples, modified with display locking:
  <script>
  async function presentContent() {
    let lock = document.getElementById("container").displayLock;
-   await lock.acquire({ timeout: Infinity; });
+   await lock.acquire({ timeout: Infinity, activatable: true });
    document.getElementById("complicated_subtree").style.display = "block";
    lock.update().then(() => { lock.commit().then(onContentPresented); });
  }
@@ -520,6 +588,11 @@ update the phases without introducing an undue delay for the rest of the
 updates. In other words, the remainder of the page remains interactive and
 animating. When the updates eventually complete, we commit and when that promise
 resolves and `onContentPresented` is invoked.
+
+Also, because we specify the `activatable` option as `true` when acquiring,
+the contents of `complicated_subtree` will be considered in focus navigation,
+anchor link navigation, find-in-page, etc. even when the content is not
+presented yet.
 
 As before, let’s see a [real example, this time using a prototype of display
 locking](https://drive.google.com/file/d/1r1aBi4P1_DMCZNXlpzW5jAibCEdT38YB/view?usp=sharing
@@ -550,6 +623,45 @@ presented without jank.
   <img src="resources/spinner_without_jank_3.jpg" alt="spinner without jank">
 </div>
 &nbsp;
+
+
+---
+### Other example
+
+In this example, we want to add a lot of items to a list in a non-janky way.
+
+```html
+<ul id="itemsList">
+ <div>Item #1</div>
+ <div>Item #2</div>
+ <div>Item #3</div>
+</ul>
+
+<script>
+// Remaining items in the list are in |remainingItems|.
+// We want to add the remaining list items asynchronously.
+remainingItems.forEach(item => {
+  requestIdleCallback((deadline) => {
+    let itemEl = createElementForItem(item);
+    itemEl.displayLock.acquire({ timeout: Infinity, activatable: true });
+    itemsList.appendChild(itemEl);
+    // We can do expensive operations to the items without worrying of the rendering costs.
+    // After we finished all the operations we can trigger a co-operative update & commit.
+    // We might do this in a fancier way by not actually committing the element,
+    // leaving it locked and detecting when to commit by using IntersectionObservers etc,
+    // but that's out of the scope of this example :)
+    doExpensiveOperationsToEl(itemEl).then(element.updateAndCommit);
+  });
+});
+
+// If we need the updated style / layout values of the element, we can do it co-operatively.
+function getOffsetTopForLockedEl(element) {
+  return new Promise((resolve) => {
+    element.displayLock.update().then(() => { resolve(element.offsetTop) };
+  });
+}
+</script>
+```
 
 ---
 ### Locked subtree vs locked element + subtree
